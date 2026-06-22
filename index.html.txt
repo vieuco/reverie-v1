@@ -1,0 +1,407 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+  <title>Reverie — AMICRE Witness</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    html, body { width: 100%; height: 100%; overflow: hidden; touch-action: none; }
+    body {
+      font-family: "Courier New", monospace;
+      background: #000; color: #fff; position: relative;
+    }
+    body::before {
+      content: ""; position: fixed; top: 0; left: 0;
+      width: 100%; height: 100%;
+      background: repeating-linear-gradient(0deg,
+        rgba(0,0,0,0.15) 0px, rgba(0,0,0,0.15) 1px,
+        transparent 1px, transparent 2px);
+      pointer-events: none; z-index: 100; mix-blend-mode: overlay;
+    }
+    #canvas-container {
+      position: fixed; top: 0; left: 0;
+      width: 100%; height: 100%; z-index: 1;
+    }
+    #ui {
+      position: fixed; bottom: 20px; left: 0; width: 100%;
+      display: flex; justify-content: center; gap: 12px; z-index: 10;
+      pointer-events: none;
+    }
+    .btn {
+      pointer-events: auto;
+      background: rgba(255,255,255,0.1);
+      border: 1px solid rgba(255,255,255,0.3);
+      color: #fff; font-family: "Courier New", monospace;
+      font-size: 12px; padding: 8px 12px; cursor: pointer;
+      transition: all 0.2s ease;
+    }
+    .btn:hover { background: rgba(255,255,255,0.2); }
+    .btn.active {
+      background: rgba(255,255,255,0.25);
+      box-shadow: 0 0 10px rgba(0,255,255,0.5);
+    }
+    #loading {
+      position: fixed; top: 0; left: 0; width: 100%; height: 100%;
+      background: #000; display: flex; align-items: center;
+      justify-content: center; font-size: 14px; z-index: 9999;
+      flex-direction: column; gap: 10px;
+    }
+    #tap-start {
+      font-size: 16px; opacity: 0;
+      animation: pulse 2s infinite;
+    }
+    @keyframes pulse {
+      0% { opacity: 0.3; } 50% { opacity: 1; } 100% { opacity: 0.3; }
+    }
+    #particle-canvas {
+      position: fixed; top: 0; left: 0;
+      width: 100%; height: 100%; pointer-events: none; z-index: 5;
+    }
+  </style>
+</head>
+<body>
+  <div id="loading">
+    <div>LOADING REVERIE...</div>
+    <div id="tap-start">TAP TO START</div>
+  </div>
+  <div id="canvas-container"></div>
+  <canvas id="particle-canvas"></canvas>
+  <div id="ui">
+    <input type="file" id="upload" accept="image/*" class="btn" style="display:none;">
+    <label for="upload" class="btn">UPLOAD PORTRAIT</label>
+    <button class="btn" id="y2k-toggle">Y2K MODE: OFF</button>
+    <button class="btn" id="glitch-toggle">GLITCH MODE: OFF</button>
+  </div>
+
+  <!-- Three.js 0.169.0 + addons をCDNから読み込む -->
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://cdn.jsdelivr.net/npm/three@0.169.0/build/three.module.js",
+        "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.169.0/examples/jsm/"
+      }
+    }
+  </script>
+
+  <script type="module">
+    import * as THREE from 'three';
+    import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+    import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+    import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+    import { BokehPass } from 'three/addons/postprocessing/BokehPass.js';
+    import { FilmPass } from 'three/addons/postprocessing/FilmPass.js';
+    import { ShaderPass } from 'three/addons/postprocessing/ShaderPass.js';
+    import { GammaCorrectionShader } from 'three/addons/shaders/GammaCorrectionShader.js';
+
+    // Chromatic Aberration Shader（カスタム）
+    const ChromaticAberrationShader = {
+      uniforms: {
+        tDiffuse: { value: null },
+        amount: { value: 0.005 },
+      },
+      vertexShader: `
+        varying vec2 vUv;
+        void main() {
+          vUv = uv;
+          gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+        }
+      `,
+      fragmentShader: `
+        uniform sampler2D tDiffuse;
+        uniform float amount;
+        varying vec2 vUv;
+        void main() {
+          vec2 rOffset = vUv + vec2(amount, 0.0);
+          vec2 gOffset = vUv;
+          vec2 bOffset = vUv - vec2(amount, 0.0);
+          float r = texture2D(tDiffuse, rOffset).r;
+          float g = texture2D(tDiffuse, gOffset).g;
+          float b = texture2D(tDiffuse, bOffset).b;
+          gl_FragColor = vec4(r, g, b, 1.0);
+        }
+      `
+    };
+
+    // Portrait Shader
+    const portraitVertexShader = `
+      varying vec3 vNormal;
+      varying vec2 vUv;
+      varying vec3 vViewDir;
+      uniform float time;
+      uniform vec2 mouse;
+
+      void main() {
+        vNormal = normalMatrix * normal;
+        vUv = uv;
+        vec4 mvPosition = modelViewMatrix * vec4(position, 1.0);
+        vViewDir = -mvPosition.xyz;
+
+        float edge = smoothstep(0.4, 0.6, uv.y);
+        float ripple = sin(uv.y * 10.0 + time * 2.0) * 0.002 * edge;
+        vec3 pos = position;
+        pos.x += ripple;
+
+        vec2 uvOffset = (mouse - 0.5) * 0.15;
+        vUv += uvOffset;
+
+        gl_Position = projectionMatrix * modelViewMatrix * vec4(pos, 1.0);
+      }
+    `;
+
+    const portraitFragmentShader = `
+      uniform sampler2D map;
+      uniform float time;
+      varying vec3 vNormal;
+      varying vec2 vUv;
+      varying vec3 vViewDir;
+
+      void main() {
+        vec4 tex = texture2D(map, vUv);
+        float fresnel = pow(1.0 - abs(dot(normalize(vNormal), normalize(vViewDir))), 2.0);
+        vec3 rim = vec3(0.8, 0.9, 1.0) * fresnel * 0.4;
+        vec3 warmth = vec3(1.0, 0.7, 0.5) * (fresnel * 0.3);
+        vec3 color = tex.rgb + rim + warmth;
+        gl_FragColor = vec4(color, tex.a);
+      }
+    `;
+
+    // Particle System
+    class ParticleSystem {
+      constructor(canvas) {
+        this.canvas = canvas;
+        this.ctx = canvas.getContext('2d');
+        this.particles = [];
+        this.resize();
+        window.addEventListener('resize', () => this.resize());
+        canvas.addEventListener('click', (e) => this.explode(e.clientX, e.clientY));
+        canvas.addEventListener('touchstart', (e) => {
+          e.preventDefault();
+          const t = e.touches[0];
+          this.explode(t.clientX, t.clientY);
+        }, { passive: false });
+      }
+
+      resize() {
+        this.canvas.width = window.innerWidth;
+        this.canvas.height = window.innerHeight;
+      }
+
+      addParticle(x, y, burst = false) {
+        this.particles.push({
+          x, y,
+          vx: (Math.random() - 0.5) * (burst ? 4 : 0.8),
+          vy: (Math.random() - 0.5) * (burst ? 4 : 0.8),
+          life: burst ? 1.0 : Math.random() * 0.8 + 0.2,
+          decay: burst ? 0.03 : 0.002,
+          size: burst ? Math.random() * 3 + 1 : Math.random() * 1.5 + 0.5,
+          hue: Math.random() * 60 + 180
+        });
+      }
+
+      explode(x, y) {
+        for (let i = 0; i < 30; i++) this.addParticle(x, y, true);
+      }
+
+      update() {
+        this.ctx.clearRect(0, 0, this.canvas.width, this.canvas.height);
+        if (Math.random() < 0.05) {
+          this.addParticle(
+            Math.random() * this.canvas.width,
+            Math.random() * this.canvas.height,
+            false
+          );
+        }
+        for (let i = this.particles.length - 1; i >= 0; i--) {
+          const p = this.particles[i];
+          p.x += p.vx;
+          p.y += p.vy;
+          p.life -= p.decay;
+          if (p.life <= 0) {
+            this.particles.splice(i, 1);
+            continue;
+          }
+          this.ctx.globalAlpha = p.life;
+          this.ctx.fillStyle = `hsl(${p.hue}, 70%, 70%)`;
+          this.ctx.beginPath();
+          this.ctx.arc(p.x, p.y, p.size, 0, Math.PI * 2);
+          this.ctx.fill();
+        }
+        this.ctx.globalAlpha = 1.0;
+      }
+    }
+
+    // Main
+    let scene, camera, renderer, composer;
+    let portraitMesh, portraitMaterial;
+    let lightCyan, lightMagenta;
+    let mouse = { x: 0, y: 0 };
+    let y2kMode = false, glitchMode = false;
+    let particleSystem;
+    let started = false;
+
+    function init() {
+      scene = new THREE.Scene();
+      camera = new THREE.PerspectiveCamera(50, window.innerWidth / window.innerHeight, 0.1, 100);
+      camera.position.z = 2.5;
+
+      const container = document.getElementById('canvas-container');
+      renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+      container.appendChild(renderer.domElement);
+
+      lightCyan = new THREE.PointLight(0x00ffff, 1.5, 6);
+      lightCyan.position.set(1, 1, 2);
+      scene.add(lightCyan);
+
+      lightMagenta = new THREE.PointLight(0xff00ff, 1.5, 6);
+      lightMagenta.position.set(-1, -1, 2);
+      scene.add(lightMagenta);
+      scene.add(new THREE.AmbientLight(0xffffff, 0.3));
+
+      portraitMaterial = new THREE.ShaderMaterial({
+        uniforms: {
+          map: { value: null },
+          time: { value: 0 },
+          mouse: { value: new THREE.Vector2(0.5, 0.5) }
+        },
+        vertexShader: portraitVertexShader,
+        fragmentShader: portraitFragmentShader
+      });
+
+      const geometry = new THREE.PlaneGeometry(1.6, 2.0);
+      portraitMesh = new THREE.Mesh(geometry, portraitMaterial);
+      scene.add(portraitMesh);
+
+      composer = new EffectComposer(renderer);
+      const renderPass = new RenderPass(scene, camera);
+      composer.addPass(renderPass);
+
+      const bloomPass = new UnrealBloomPass(
+        new THREE.Vector2(window.innerWidth, window.innerHeight),
+        0.8, 0.4, 0.85
+      );
+      composer.addPass(bloomPass);
+
+      const bokehPass = new BokehPass(scene, camera, {
+        focus: 2.5,
+        aperture: 0.025,
+        maxblur: 0.01
+      });
+      composer.addPass(bokehPass);
+
+      const filmPass = new FilmPass(0.25, 0.5, 1024, false);
+      composer.addPass(filmPass);
+
+      const chromaPass = new ShaderPass(ChromaticAberrationShader);
+      composer.addPass(chromaPass);
+
+      const gammaPass = new ShaderPass(GammaCorrectionShader);
+      composer.addPass(gammaPass);
+
+      particleSystem = new ParticleSystem(document.getElementById('particle-canvas'));
+
+      window.addEventListener('resize', onWindowResize);
+      window.addEventListener('mousemove', onMouseMove);
+      window.addEventListener('touchmove', (e) => {
+        e.preventDefault();
+        const t = e.touches[0];
+        onMouseMove({ clientX: t.clientX, clientY: t.clientY });
+      }, { passive: false });
+
+      document.getElementById('upload').addEventListener('change', handleImageUpload);
+      document.getElementById('y2k-toggle').addEventListener('click', toggleY2K);
+      document.getElementById('glitch-toggle').addEventListener('click', toggleGlitch);
+
+      document.getElementById('tap-start').style.opacity = 1;
+      document.getElementById('loading').addEventListener('click', startExperience);
+      document.getElementById('loading').addEventListener('touchstart', startExperience);
+    }
+
+    function startExperience() {
+      if (started) return;
+      started = true;
+      document.getElementById('loading').style.display = 'none';
+      animate();
+    }
+
+    function onWindowResize() {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      composer.setSize(window.innerWidth, window.innerHeight);
+      particleSystem.resize();
+    }
+
+    function onMouseMove(event) {
+      mouse.x = (event.clientX / window.innerWidth);
+      mouse.y = 1.0 - (event.clientY / window.innerHeight);
+      camera.rotation.x = (mouse.y - 0.5) * 0.1;
+      camera.rotation.y = (mouse.x - 0.5) * 0.1;
+      lightCyan.position.x = (mouse.x - 0.5) * 3;
+      lightCyan.position.y = (mouse.y - 0.5) * 3;
+      lightMagenta.position.x = -(mouse.x - 0.5) * 3;
+      lightMagenta.position.y = -(mouse.y - 0.5) * 3;
+      portraitMaterial.uniforms.mouse.value.set(mouse.x, mouse.y);
+    }
+
+    function handleImageUpload(event) {
+      const file = event.target.files[0];
+      if (!file) return;
+      const reader = new FileReader();
+      reader.onload = function(e) {
+        const img = new Image();
+        img.onload = function() {
+          const texture = new THREE.Texture(img);
+          texture.needsUpdate = true;
+          const aspect = img.width / img.height;
+          portraitMesh.scale.x = aspect * 1.6;
+          portraitMaterial.uniforms.map.value = texture;
+        };
+        img.src = e.target.result;
+      };
+      reader.readAsDataURL(file);
+    }
+
+    function toggleY2K() {
+      y2kMode = !y2kMode;
+      const btn = document.getElementById('y2k-toggle');
+      btn.textContent = `Y2K MODE: ${y2kMode ? 'ON' : 'OFF'}`;
+      btn.classList.toggle('active', y2kMode);
+    }
+
+    function toggleGlitch() {
+      glitchMode = !glitchMode;
+      const btn = document.getElementById('glitch-toggle');
+      btn.textContent = `GLITCH MODE: ${glitchMode ? 'ON' : 'OFF'}`;
+      btn.classList.toggle('active', glitchMode);
+    }
+
+    let clock = new THREE.Clock();
+    function animate() {
+      requestAnimationFrame(animate);
+      const t = clock.getElapsedTime();
+      portraitMaterial.uniforms.time.value = t;
+      const filmPass = composer.passes[3];
+      const chromaPass = composer.passes[4];
+      if (y2kMode) {
+        filmPass.uniforms.nIntensity.value = 0.4;
+        filmPass.uniforms.sIntensity.value = 0.6;
+      } else {
+        filmPass.uniforms.nIntensity.value = 0.25;
+        filmPass.uniforms.sIntensity.value = 0.5;
+      }
+      if (glitchMode) {
+        chromaPass.uniforms.amount.value = 0.01 + Math.sin(t * 5) * 0.005;
+      } else {
+        chromaPass.uniforms.amount.value = 0.005;
+      }
+      particleSystem.update();
+      composer.render();
+    }
+
+    init();
+  </script>
+</body>
+</html>
